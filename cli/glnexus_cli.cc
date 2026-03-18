@@ -16,6 +16,7 @@
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/stdout_sinks.h"
 #include "cli_utils.h"
+#include "incremental.h"
 
 using namespace std;
 
@@ -198,6 +199,12 @@ void help(const char* prog) {
          << "  --mem-gbytes X, -m X           memory budget, in gbytes (default: most of system memory)" << endl
          << "  --threads X, -t X              thread budget (default: all hardware threads)" << endl << endl
 
+         << "  --incremental                  incremental mode: add new samples to an existing database" << endl
+         << "                                 (DB directory must already exist from a previous run)" << endl
+         << "  --force-full                   in incremental mode, force full re-run ignoring cache" << endl
+         << "  --validate                     in incremental mode, compare results with full pipeline" << endl
+         << "  --compact-cache                in incremental mode, clean up cached data and exit" << endl << endl
+
          << "  --help, -h                     print this help message" << endl
          << endl << "Configuration presets:" << endl;
     cout << GLnexus::cli::utils::describe_config_presets() << endl;
@@ -237,6 +244,10 @@ int main(int argc, char *argv[]) {
         {"bucket_size", required_argument, 0, 'x'},
         {"debug", no_argument, 0, 'g'},
         {"iter_compare", no_argument, 0, 'i'},
+        {"incremental", no_argument, 0, 'I'},
+        {"force-full", no_argument, 0, 'F'},
+        {"validate", no_argument, 0, 'V'},
+        {"compact-cache", no_argument, 0, 'K'},
         {0, 0, 0, 0}
     };
 
@@ -249,6 +260,10 @@ int main(int argc, char *argv[]) {
     bool list_of_files = false;
     bool debug = false;
     bool iter_compare = false;
+    bool incremental = false;
+    bool force_full = false;
+    bool validate = false;
+    bool compact_cache = false;
     string bedfilename;
     size_t mem_budget = 0, nr_threads = 0;
     size_t bucket_size = GLnexus::BCFKeyValueData::default_bucket_size;
@@ -302,6 +317,22 @@ int main(int argc, char *argv[]) {
                 iter_compare = true;
                 break;
 
+            case 'I':
+                incremental = true;
+                break;
+
+            case 'F':
+                force_full = true;
+                break;
+
+            case 'V':
+                validate = true;
+                break;
+
+            case 'K':
+                compact_cache = true;
+                break;
+
             case 'x':
                 bucket_size = strtoul(optarg, nullptr, 10);
                 if (bucket_size == 0 || bucket_size > 1000000000) {
@@ -332,7 +363,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (optind > argc-1) {
+    if (optind > argc-1 && !incremental) {
         help(argv[0]);
         return 1;
     }
@@ -355,6 +386,18 @@ int main(int argc, char *argv[]) {
         }
     } else {
         vcf_files = vcf_files_precursor;
+    }
+
+    if (incremental) {
+        GLnexus::incremental_config incr_cfg;
+        incr_cfg.mem_budget = mem_budget;
+        incr_cfg.nr_threads = nr_threads;
+        incr_cfg.force_full = force_full;
+        incr_cfg.validate = validate;
+        incr_cfg.compact_cache = compact_cache;
+        return GLnexus::incremental_steps(vcf_files, bedfilename, dbpath, config_name,
+                                          more_PL, squeeze, trim_uncalled_alleles,
+                                          incr_cfg, debug);
     }
 
     return all_steps(vcf_files, bedfilename, dbpath, config_name, more_PL, squeeze, trim_uncalled_alleles,
