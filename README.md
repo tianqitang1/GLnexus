@@ -1,3 +1,5 @@
+> **Note:** This is a fork of [dnanexus-rnd/GLnexus](https://github.com/dnanexus-rnd/GLnexus) with added support for **incremental joint genotyping** — allowing new samples to be merged into an existing database without reprocessing all samples from scratch.
+
 # GLnexus
 **From DNAnexus R&D: scalable gVCF merging and joint variant calling for population sequencing projects.**
 (GL, genotype likelihood)
