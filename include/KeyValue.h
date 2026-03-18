@@ -134,6 +134,11 @@ public:
 
     /// Ensure all writes are flushed to storage
     virtual Status flush() = 0;
+
+    /// Skip waiting for background compactions on close (BULK_LOAD mode).
+    /// After flush(), all data is persisted and readable on reopen;
+    /// compactions are a background optimization, not required for correctness.
+    virtual void skip_compaction_on_close() {}
 };
 
 }}

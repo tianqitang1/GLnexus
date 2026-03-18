@@ -579,7 +579,10 @@ static bool discovered_alleles_equal(const discovered_alleles& a, const discover
 static std::shared_ptr<spdlog::logger> get_console() {
     auto logger = spdlog::get("GLnexus");
     if (!logger) {
-        logger = spdlog::stderr_logger_mt("GLnexus_incremental");
+        logger = spdlog::get("GLnexus_incremental");
+        if (!logger) {
+            logger = spdlog::stderr_logger_mt("GLnexus_incremental");
+        }
     }
     return logger;
 }
@@ -623,7 +626,7 @@ int incremental_steps(const vector<string>& new_gvcf_files,
         return 1;
     }
 
-    // Phase 3: --compact-cache — clean up cached data and exit
+    // --compact-cache — clean up cached data and exit
     if (incr_cfg.compact_cache) {
         console->info("Compacting incremental cache...");
         unique_ptr<KeyValue::DB> db;
@@ -639,78 +642,28 @@ int incremental_steps(const vector<string>& new_gvcf_files,
         return 0;
     }
 
-    // Step 3: Open DB briefly in NORMAL mode to read metadata, then close
-    // (we'll need to close before db_bulk_load, which opens its own handle)
+    // Step 3: Import new gVCFs if any (db_bulk_load opens its own BULK_LOAD handle)
+    // Opt 2: Skip compaction wait — data is flushed and readable on reopen.
+    // Opt 3: We don't open the DB for metadata first; instead we read metadata
+    //        after import in the single NORMAL-mode open below.
     vector<pair<string,size_t>> contigs;
-    string old_sampleset;
-    shared_ptr<const set<string>> old_samples;
-    bool has_cache = false;
-    {
-        unique_ptr<KeyValue::DB> db;
-        RocksKeyValue::config opt;
-        opt.mode = RocksKeyValue::OpenMode::NORMAL;
-        opt.pfx = cli::utils::GLnexus_prefix_spec();
-        opt.mem_budget = mem_budget;
-        opt.thread_budget = nr_threads;
-        HI("open database for metadata", RocksKeyValue::Open(dbpath, opt, db));
-
-        // Ensure incremental collections exist
-        HI("ensure incremental collections", ensure_incremental_collections(db.get()));
-
-        // Check config consistency
-        {
-            string cached_crc;
-            Status cs = get_incremental_meta(db.get(), "config_crc32c", cached_crc);
-            if (cs.ok() && cached_crc != cfg_crc32c) {
-                if (incr_cfg.force_full) {
-                    console->warn("Config CRC mismatch (cached={}, current={}). Forcing full re-run.",
-                                  cached_crc, cfg_crc32c);
-                } else {
-                    console->error("Config CRC mismatch (cached={}, current={}). Use --force-full to override.",
-                                   cached_crc, cfg_crc32c);
-                    return 1;
-                }
-            }
-        }
-
-        // Get contigs
-        {
-            unique_ptr<BCFKeyValueData> data;
-            HI("open BCFKeyValueData", BCFKeyValueData::Open(db.get(), data));
-            HI("get contigs", data->contigs(contigs));
-        }
-
-        // Get old sampleset info (before importing new samples)
-        {
-            Status ms = get_incremental_meta(db.get(), "sampleset", old_sampleset);
-            if (ms.ok() && !incr_cfg.force_full) {
-                unique_ptr<BCFKeyValueData> data;
-                HI("open BCFKeyValueData for old sampleset", BCFKeyValueData::Open(db.get(), data));
-                Status ss = data->sampleset_samples(old_sampleset, old_samples);
-                if (ss.ok()) {
-                    has_cache = true;
-                    console->info("Found cache from previous run ({} samples, sampleset={})",
-                                  old_samples->size(), old_sampleset);
-                } else {
-                    console->warn("Could not load previous sampleset '{}': {}. Full pipeline.",
-                                  old_sampleset, ss.str());
-                }
-            }
-        }
-        // DB handle released here
-    }
-
-    // Step 4: Import new gVCFs (db_bulk_load opens its own handle in BULK_LOAD mode)
     if (!new_gvcf_files.empty()) {
-        vector<range> import_ranges; // empty = no range filter
         console->info("Importing {} new gVCF files...", new_gvcf_files.size());
-        // Pass nullptr for db_out so db_bulk_load fully closes the handle (waits for compactions)
+        vector<range> import_ranges; // empty = no range filter
+        unique_ptr<KeyValue::DB> bulk_db;
+        // db_bulk_load fills contigs as an output parameter
         HI("bulk load new gVCFs",
            cli::utils::db_bulk_load(console, mem_budget, nr_threads, new_gvcf_files, dbpath,
-                                    import_ranges, contigs, nullptr, false));
+                                    import_ranges, contigs, &bulk_db, false));
+        // Opt 2: Skip compaction wait on close. db_bulk_load already called flush().
+        if (bulk_db) {
+            bulk_db->skip_compaction_on_close();
+            bulk_db.reset();
+        }
     }
 
-    // Step 5: Reopen DB in NORMAL mode for discovery/unification/caching
+    // Step 4: Open DB in NORMAL mode — single open for all remaining operations
+    // (metadata read, discovery, unification, caching, AND genotyping)
     unique_ptr<KeyValue::DB> db;
     {
         RocksKeyValue::config opt;
@@ -718,12 +671,57 @@ int incremental_steps(const vector<string>& new_gvcf_files,
         opt.pfx = cli::utils::GLnexus_prefix_spec();
         opt.mem_budget = mem_budget;
         opt.thread_budget = nr_threads;
-        HI("reopen database", RocksKeyValue::Open(dbpath, opt, db));
+        HI("open database", RocksKeyValue::Open(dbpath, opt, db));
     }
-    // Re-ensure incremental collections (in case bulk_load recreated the DB)
+
+    // Ensure incremental collections exist
     HI("ensure incremental collections", ensure_incremental_collections(db.get()));
 
-    // Step 6: Get current sampleset and determine new samples
+    // Read contigs (may not have been read yet if no new files were imported)
+    if (contigs.empty()) {
+        unique_ptr<BCFKeyValueData> data;
+        HI("open BCFKeyValueData", BCFKeyValueData::Open(db.get(), data));
+        HI("get contigs", data->contigs(contigs));
+    }
+
+    // Check config consistency
+    {
+        string cached_crc;
+        Status cs = get_incremental_meta(db.get(), "config_crc32c", cached_crc);
+        if (cs.ok() && cached_crc != cfg_crc32c) {
+            if (incr_cfg.force_full) {
+                console->warn("Config CRC mismatch (cached={}, current={}). Forcing full re-run.",
+                              cached_crc, cfg_crc32c);
+            } else {
+                console->error("Config CRC mismatch (cached={}, current={}). Use --force-full to override.",
+                               cached_crc, cfg_crc32c);
+                return 1;
+            }
+        }
+    }
+
+    // Get old sampleset info (from previous incremental run)
+    string old_sampleset;
+    shared_ptr<const set<string>> old_samples;
+    bool has_cache = false;
+    {
+        Status ms = get_incremental_meta(db.get(), "sampleset", old_sampleset);
+        if (ms.ok() && !incr_cfg.force_full) {
+            unique_ptr<BCFKeyValueData> data;
+            HI("open BCFKeyValueData for old sampleset", BCFKeyValueData::Open(db.get(), data));
+            Status ss = data->sampleset_samples(old_sampleset, old_samples);
+            if (ss.ok()) {
+                has_cache = true;
+                console->info("Found cache from previous run ({} samples, sampleset={})",
+                              old_samples->size(), old_sampleset);
+            } else {
+                console->warn("Could not load previous sampleset '{}': {}. Full pipeline.",
+                              old_sampleset, ss.str());
+            }
+        }
+    }
+
+    // Get current sampleset and determine new samples
     string current_sampleset;
     shared_ptr<const set<string>> current_samples;
     unsigned sample_count = 0;
@@ -744,7 +742,7 @@ int incremental_steps(const vector<string>& new_gvcf_files,
         }
     }
 
-    // Step 10: Determine ranges
+    // Determine ranges
     vector<range> ranges;
     if (bedfilename.empty()) {
         console->warn("Processing full length of {} contigs, as no --bed was provided.", contigs.size());
@@ -755,26 +753,17 @@ int incremental_steps(const vector<string>& new_gvcf_files,
         HI("parse BED file", cli::utils::parse_bed_file(console, bedfilename, contigs, ranges));
     }
 
-    // Step 11: Discovery
+    // Discovery
     // If we have cache AND new samples, do incremental discovery.
     // Otherwise, do full discovery and cache the results.
     vector<discovered_alleles> dsals_by_contig(contigs.size());
     vector<bool> contig_dirty(contigs.size(), false);
 
     if (has_cache && added_samples.empty()) {
-        // ---- NO NEW SAMPLES: USE CACHED RESULTS ----
-        console->info("No new samples detected. Using cached discovery results.");
-        for (int rid = 0; rid < (int)contigs.size(); rid++) {
-            Status cs = get_cached_discovered_alleles(db.get(), rid, dsals_by_contig[rid]);
-            if (cs == StatusCode::NOT_FOUND) {
-                // No cached alleles for this contig — that's normal (e.g., no variants)
-            } else if (cs.bad()) {
-                console->error("Failed to load cached discovered alleles for contig {}: {}",
-                               contigs[rid].first, cs.str());
-                return 1;
-            }
-            // All contigs are clean — unified sites cache is valid
-        }
+        // ---- NO NEW SAMPLES: skip loading discovered alleles entirely ----
+        // Opt 4: Clean contigs load unified sites from cache directly;
+        // dsals_by_contig is not needed since no contigs are dirty.
+        console->info("No new samples detected. Using cached results (skipping discovery).");
     } else if (has_cache && !added_samples.empty()) {
         // ---- INCREMENTAL DISCOVERY ----
         console->info("Running incremental discovery for {} new samples...", added_samples.size());
@@ -885,7 +874,7 @@ int incremental_steps(const vector<string>& new_gvcf_files,
         console->info("Full discovery complete. All contigs marked dirty.");
     }
 
-    // Step 12: Unification (parallel over contigs)
+    // Unification (parallel over contigs)
     console->info("Unifying sites...");
     auto nr_threads_m2 = nr_threads > 2 ? nr_threads - 2 : 1;
     ctpl::thread_pool unify_pool(nr_threads_m2);
@@ -938,31 +927,30 @@ int incremental_steps(const vector<string>& new_gvcf_files,
     console->info("Unified to {} sites with {} ALT alleles. {} lost, {} filtered.",
                   sites.size(), stats.unified_alleles, stats.lost_alleles, stats.filtered_alleles);
 
-    // Step 13: Update incremental metadata
+    // Update incremental metadata
     HI("save config CRC", put_incremental_meta(db.get(), "config_crc32c", cfg_crc32c));
     HI("save sampleset", put_incremental_meta(db.get(), "sampleset", current_sampleset));
     HI("save sample count", put_incremental_meta(db.get(), "sample_count", to_string(sample_count)));
 
-    // Phase 2: Check if we can skip genotyping entirely (no new samples, all sites clean)
+    // Check if we can skip genotyping entirely (no new samples, all sites clean)
     bool any_dirty = false;
     for (size_t i = 0; i < contigs.size(); i++) {
         if (contig_dirty[i]) { any_dirty = true; break; }
     }
 
-    // Step 14: Flush and close DB before genotyping (genotype() opens its own DB handle)
-    console->info("Flushing database...");
-    HI("flush database", db->flush());
-    db.reset();
-
     if (has_cache && added_samples.empty() && !any_dirty && !incr_cfg.force_full) {
-        // Phase 2: Nothing changed — output is identical to previous run
+        // Nothing changed — output is identical to previous run
         console->info("No changes detected. Output would be identical to previous run. Skipping genotyping.");
+        HI("flush database", db->flush());
         console->info("Incremental pipeline complete (no-op).");
         return 0;
     }
 
-    // Step 15: Genotype all sites for all samples
-    // Phase 3: Progress reporting
+    // Flush before genotyping (ensure all cached data is persisted)
+    HI("flush database", db->flush());
+
+    // Genotype all sites for all samples
+    // Opt 1: Reuse the existing NORMAL-mode DB handle instead of reopening in READ_ONLY
     console->info("Genotyping {} sites across {} samples...", sites.size(), sample_count);
     genotyper_cfg.output_residuals = debug;
     vector<string> hdr_lines = {
@@ -971,59 +959,90 @@ int incremental_steps(const vector<string>& new_gvcf_files,
         ("##GLnexusConfig=" + cfg_txt),
         "##GLnexusIncrementalMode=true"
     };
-    string outfile("-");
-    HI("genotype",
-       cli::utils::genotype(console, mem_budget, nr_threads, dbpath, genotyper_cfg, sites, hdr_lines, outfile));
 
-    // Phase 3: Validation mode — run full pipeline and compare
+    // In validate mode, write to a temp file so we can compare with full pipeline output.
+    // Otherwise, write to stdout.
+    string incr_bcf_path;
     if (incr_cfg.validate) {
-        console->info("Validation mode: running full pipeline for comparison...");
-        // Re-run full discovery on all samples
-        {
-            unique_ptr<KeyValue::DB> vdb;
-            RocksKeyValue::config vopt;
-            vopt.mode = RocksKeyValue::OpenMode::READ_ONLY;
-            vopt.pfx = cli::utils::GLnexus_prefix_spec();
-            vopt.mem_budget = mem_budget;
-            vopt.thread_budget = nr_threads;
-            HI("open database for validation", RocksKeyValue::Open(dbpath, vopt, vdb));
+        incr_bcf_path = dbpath + ".incremental_validate.bcf";
+        console->info("Validation mode: writing incremental output to {}", incr_bcf_path);
+    } else {
+        incr_bcf_path = "-";
+    }
+    HI("genotype",
+       cli::utils::genotype(console, nr_threads, db.get(), genotyper_cfg, sites, hdr_lines, incr_bcf_path));
 
-            discovered_alleles full_dsals;
-            unsigned full_N = 0;
-            HI("full discovery for validation",
-               cli::utils::discover_alleles(console, nr_threads, vdb.get(), ranges, contigs,
-                                            full_dsals, full_N, unifier_cfg.min_allele_copy_number == 0));
+    // Validation mode — run full pipeline and compare genotypes
+    if (incr_cfg.validate) {
+        console->info("Validation: running full pipeline for comparison...");
 
-            // Compare allele counts
-            size_t incr_total = 0;
-            for (size_t i = 0; i < contigs.size(); i++) {
-                incr_total += dsals_by_contig[i].size();
-            }
-            console->info("Validation: incremental discovered {} alleles, full discovered {} alleles",
-                          incr_total, full_dsals.size());
+        // 1. Full discovery
+        discovered_alleles full_dsals;
+        unsigned full_N = 0;
+        HI("full discovery for validation",
+           cli::utils::discover_alleles(console, nr_threads, db.get(), ranges, contigs,
+                                        full_dsals, full_N, unifier_cfg.min_allele_copy_number == 0));
+        console->info("Validation: full discovery found {} alleles from {} samples",
+                      full_dsals.size(), full_N);
 
-            // Partition full alleles by contig and compare per-contig
-            vector<discovered_alleles> full_by_contig(contigs.size());
-            for (auto p = full_dsals.begin(); p != full_dsals.end(); full_dsals.erase(p++)) {
-                UNPAIR(*p, al, dai);
-                full_by_contig[al.pos.rid][al] = dai;
-            }
+        // 2. Full unification
+        // Partition full alleles by contig
+        vector<discovered_alleles> full_by_contig(contigs.size());
+        for (auto p = full_dsals.begin(); p != full_dsals.end(); full_dsals.erase(p++)) {
+            UNPAIR(*p, al, dai);
+            full_by_contig[al.pos.rid][al] = dai;
+        }
 
-            size_t mismatched_contigs = 0;
-            for (size_t i = 0; i < contigs.size(); i++) {
-                if (!discovered_alleles_equal(dsals_by_contig[i], full_by_contig[i])) {
-                    console->warn("Validation: contig {} alleles differ (incremental={}, full={})",
-                                  contigs[i].first, dsals_by_contig[i].size(), full_by_contig[i].size());
-                    mismatched_contigs++;
+        vector<unified_site> full_sites;
+        unifier_stats full_stats;
+        for (size_t i = 0; i < contigs.size(); i++) {
+            if (!full_by_contig[i].empty()) {
+                vector<unified_site> si;
+                unifier_stats sti;
+                Status us = cli::utils::unify_sites(console, unifier_cfg, contigs,
+                                                    full_by_contig[i], full_N, si, sti);
+                if (us.bad()) {
+                    console->error("Validation: full unification failed for contig {}: {}",
+                                   contigs[i].first, us.str());
+                } else {
+                    full_sites.insert(full_sites.end(), make_move_iterator(si.begin()),
+                                      make_move_iterator(si.end()));
+                    full_stats += sti;
                 }
             }
-
-            if (mismatched_contigs == 0) {
-                console->info("Validation PASSED: incremental discovery matches full discovery");
-            } else {
-                console->error("Validation FAILED: {} contigs have mismatched alleles", mismatched_contigs);
-            }
         }
+        console->info("Validation: full pipeline unified to {} sites ({} ALT alleles)",
+                      full_sites.size(), full_stats.unified_alleles);
+        console->info("Validation: incremental pipeline unified to {} sites ({} ALT alleles)",
+                      sites.size(), stats.unified_alleles);
+        if (full_sites.size() != sites.size()) {
+            console->error("Validation: site count mismatch (incremental={}, full={})",
+                           sites.size(), full_sites.size());
+        }
+
+        // 3. Full genotyping to temp file
+        string full_bcf_path = dbpath + ".full_validate.bcf";
+        vector<string> full_hdr_lines = {
+            ("##GLnexusConfigName=" + config_name),
+            ("##GLnexusConfigCRC32C=" + cfg_crc32c),
+            ("##GLnexusConfig=" + cfg_txt),
+        };
+        HI("full genotyping for validation",
+           cli::utils::genotype(console, nr_threads, db.get(), genotyper_cfg,
+                                full_sites, full_hdr_lines, full_bcf_path));
+
+        // 4. Compare genotypes field by field
+        string report;
+        Status vs = validate_bcf_genotypes(incr_bcf_path, full_bcf_path, report);
+        if (vs.ok()) {
+            console->info("Validation PASSED: genotypes match. {}", report);
+        } else {
+            console->error("Validation FAILED: {}", report);
+        }
+
+        // Clean up temp files
+        unlink(incr_bcf_path.c_str());
+        unlink(full_bcf_path.c_str());
     }
 
     console->info("Incremental pipeline complete.");

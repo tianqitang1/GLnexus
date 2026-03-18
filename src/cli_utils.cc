@@ -1666,13 +1666,30 @@ Status genotype(std::shared_ptr<spdlog::logger> logger,
     cfg.thread_budget = nr_threads;
     unique_ptr<KeyValue::DB> db;
     S(RocksKeyValue::Open(dbpath, cfg, db));
+
+    return genotype(logger, nr_threads, db.get(), genotyper_cfg, sites, extra_header_lines, output_filename);
+}
+
+Status genotype(std::shared_ptr<spdlog::logger> logger,
+                size_t nr_threads,
+                KeyValue::DB *db,
+                const genotyper_config &genotyper_cfg,
+                const vector<unified_site> &sites,
+                const vector<string>& extra_header_lines,
+                const string &output_filename) {
+    Status s;
+
+    if (nr_threads == 0) {
+        nr_threads = std::thread::hardware_concurrency();
+    }
+
     unique_ptr<BCFKeyValueData> data;
-    S(BCFKeyValueData::Open(db.get(), data));
+    S(BCFKeyValueData::Open(db, data));
 
     std::vector<std::pair<std::string,size_t> > contigs;
     S(data->contigs(contigs));
 
-    // start service, discover alleles, unify sites, genotype sites
+    // start service, genotype sites
     service_config svccfg;
     svccfg.threads = nr_threads;
     svccfg.extra_header_lines = extra_header_lines;
@@ -1682,7 +1699,7 @@ Status genotype(std::shared_ptr<spdlog::logger> logger,
     string sampleset;
     S(data->all_samples_sampleset(sampleset));
 
-    logger->info("genotyping {} sites; sample set = {} mem_budget = {} threads = {}", sites.size(), sampleset, mem_budget, nr_threads);
+    logger->info("genotyping {} sites; sample set = {} threads = {}", sites.size(), sampleset, nr_threads);
     S(svc->genotype_sites(genotyper_cfg, sampleset, sites, output_filename));
     logger->info("genotyping complete!");
 

@@ -170,6 +170,16 @@ Status genotype(std::shared_ptr<spdlog::logger> logger,
                 const std::vector<std::string> &extra_header_lines,
                 const std::string &output_filename);
 
+// Overload that reuses an already-open DB handle (avoids reopening the database).
+// The DB must support reads (NORMAL or READ_ONLY mode).
+Status genotype(std::shared_ptr<spdlog::logger> logger,
+                size_t nr_threads,
+                KeyValue::DB *db,
+                const GLnexus::genotyper_config &genotyper_cfg,
+                const std::vector<unified_site> &sites,
+                const std::vector<std::string> &extra_header_lines,
+                const std::string &output_filename);
+
 // compare different implementations of database iteration methods.
 //
 // n_iter: how many random queries to try

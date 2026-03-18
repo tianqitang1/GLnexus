@@ -359,6 +359,7 @@ private:
     size_t mem_budget_ = 0;
     rocksdb::WriteOptions write_options_, batch_write_options_;
     std::shared_ptr<rocksdb::Cache> block_cache_;
+    bool skip_compaction_ = false;
 
     // No copying allowed
     DB(const DB&);
@@ -471,9 +472,13 @@ public:
         return Status::OK();
     }
 
+    void skip_compaction_on_close() override {
+        skip_compaction_ = true;
+    }
+
     ~DB() override {
         flush();
-        if (mode_ == OpenMode::BULK_LOAD) {
+        if (mode_ == OpenMode::BULK_LOAD && !skip_compaction_) {
             // Wait for compactions to converge. Specifically, wait until
             // there's no more than one background compaction running.
             // Argument: once that's the case, the number of sorted runs can't
