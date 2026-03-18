@@ -137,12 +137,13 @@ set(CTPL_INCLUDE_DIR ${source_dir})
 include_directories(${CTPL_INCLUDE_DIR})
 
 ExternalProject_Add(fcmm
-    URL https://github.com/giacomodrago/fcmm/archive/v1.0.1.zip
+    URL https://github.com/respu/fcmm/archive/refs/heads/master.zip
     PREFIX ${CMAKE_CURRENT_BINARY_DIR}/external
     CONFIGURE_COMMAND ""
     BUILD_IN_SOURCE 1
     BUILD_COMMAND ""
     INSTALL_COMMAND ""
+    PATCH_COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/patch_fcmm.sh
     LOG_DOWNLOAD ON
   )
 ExternalProject_Get_Property(fcmm source_dir)
@@ -167,14 +168,14 @@ ExternalProject_Add(capnp
     PREFIX ${CMAKE_CURRENT_BINARY_DIR}/external
     CONFIGURE_COMMAND ./configure --prefix=${CMAKE_BINARY_DIR}/external
     BUILD_IN_SOURCE 1
-    BUILD_COMMAND bash -c "make -j$(nproc) check"
+    BUILD_COMMAND bash -c "make -j$(nproc)"
     INSTALL_COMMAND make install
     LOG_DOWNLOAD ON
   )
 
 execute_process(COMMAND git describe --tags --long --dirty --always
                 OUTPUT_VARIABLE GIT_REVISION OUTPUT_STRIP_TRAILING_WHITESPACE)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DGIT_REVISION=\"\\\"${GIT_REVISION}\\\"\" -pthread -std=c++14 -Wall -Werror=return-type -Werror=unused-result -Wno-sign-compare -Wno-write-strings -Wno-terminate -fdiagnostics-color=auto -march=ivybridge")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DGIT_REVISION=\"\\\"${GIT_REVISION}\\\"\" -pthread -std=c++14 -Wall -Werror=return-type -Werror=unused-result -Wno-sign-compare -Wno-write-strings -Wno-terminate -fdiagnostics-color=auto -march=ivybridge -DCATCH_CONFIG_NO_POSIX_SIGNALS")
 set(CMAKE_CXX_FLAGS_RELEASE "-gdwarf -DNDEBUG -O3")
 
 ################################
@@ -188,13 +189,14 @@ include_directories(${COMMON_INCLUDES} capnp/serialize)
 # Invoke cap'n proto IDL compiler, to generate C++ serialization code from
 # definitions.
 add_custom_command(
-  OUTPUT  capnp/serialize/defs.capnp.c++ capnp/serialize/defs.capnp.h
-  COMMAND ${CMAKE_BINARY_DIR}/external/bin/capnp compile -I${CMAKE_CURRENT_BINARY_DIR}/external/include -oexternal/bin/capnpc-c++ capnp/serialize/defs.capnp
-  DEPENDS capnp/serialize/defs.capnp
+  OUTPUT  ${CMAKE_SOURCE_DIR}/capnp/serialize/defs.capnp.c++ ${CMAKE_SOURCE_DIR}/capnp/serialize/defs.capnp.h
+  COMMAND ${CMAKE_BINARY_DIR}/external/bin/capnp compile -I${CMAKE_CURRENT_BINARY_DIR}/external/include -o${CMAKE_BINARY_DIR}/external/bin/capnpc-c++ ${CMAKE_SOURCE_DIR}/capnp/serialize/defs.capnp
+  DEPENDS ${CMAKE_SOURCE_DIR}/capnp/serialize/defs.capnp
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
   COMMENT "GLnexus: generating cap'n proto C++ and H files")
 
 add_library(glnexus
-            capnp/serialize/defs.capnp.h capnp/serialize/defs.capnp.c++
+            ${CMAKE_SOURCE_DIR}/capnp/serialize/defs.capnp.h ${CMAKE_SOURCE_DIR}/capnp/serialize/defs.capnp.c++
             include/types.h src/types.cc
             include/data.h src/data.cc
             include/compare_queries.h src/compare_queries.cc
@@ -212,6 +214,7 @@ add_library(glnexus
             include/BCF_utils.h src/BCF_utils.cc
             include/RocksKeyValue.h src/RocksKeyValue.cc
             include/cli_utils.h src/cli_utils.cc
+            include/incremental.h src/incremental.cc
             test/utils.cc)
 add_dependencies(glnexus htslib)
 add_dependencies(glnexus rocksdb)
@@ -222,11 +225,12 @@ add_dependencies(glnexus spdlog)
 add_dependencies(glnexus capnp)
 add_library(libglnexus ALIAS glnexus)
 
+LINK_DIRECTORIES(${CMAKE_BINARY_DIR}/local_lib)
 set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -march=ivybridge -static-libstdc++ -pthread")
 
 add_executable(glnexus_cli cli/glnexus_cli.cc)
 add_dependencies(glnexus_cli libglnexus)
-target_link_libraries(glnexus_cli glnexus libhts librocksdb libyaml-cpp libz.a libsnappy.a libbz2.a libzstd.a liblzma.a librt.a libcapnp.a libkj.a)
+target_link_libraries(glnexus_cli glnexus libhts librocksdb libyaml-cpp libz.a snappy libbz2.a libzstd.a liblzma.a liblz4.a librt.a libcapnp.a libkj.a)
 
 install(TARGETS glnexus_cli DESTINATION bin)
 
@@ -259,10 +263,12 @@ add_executable(unit_tests
                 test/rocks_integration.cc
                 test/unifier.cc
                 test/cli_utils.cc
-                test/cli.cc)
+                test/cli.cc
+                test/test_incremental.cc
+                test/profile_incremental.cc)
 add_dependencies(unit_tests catch)
 add_dependencies(unit_tests libglnexus)
-target_link_libraries(unit_tests glnexus libhts librocksdb libyaml-cpp libz.a libsnappy.a libbz2.a libzstd.a liblzma.a librt.a libcapnp.a libkj.a)
+target_link_libraries(unit_tests glnexus libhts librocksdb libyaml-cpp libz.a snappy libbz2.a libzstd.a liblzma.a liblz4.a librt.a libcapnp.a libkj.a)
 
 include(CTest)
 add_test(NAME unit_tests COMMAND ./unit_tests -d yes)
