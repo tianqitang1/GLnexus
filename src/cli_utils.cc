@@ -1583,6 +1583,42 @@ Status discover_alleles(std::shared_ptr<spdlog::logger> logger,
     return Status::OK();
 }
 
+Status discover_alleles_from_sampleset(std::shared_ptr<spdlog::logger> logger,
+                                       size_t nr_threads, KeyValue::DB* db,
+                                       const string &sampleset,
+                                       const vector<range> &ranges,
+                                       const vector<pair<string,size_t> > &contigs,
+                                       discovered_alleles &dsals,
+                                       unsigned &sample_count,
+                                       bool include_zero_copies) {
+    Status s;
+    unique_ptr<BCFKeyValueData> data;
+    dsals.clear();
+
+    if (nr_threads == 0) {
+        nr_threads = std::thread::hardware_concurrency();
+    }
+
+    S(BCFKeyValueData::Open(db, data));
+
+    service_config svccfg;
+    svccfg.threads = nr_threads;
+    unique_ptr<Service> svc;
+    S(Service::Start(svccfg, *data, *data, svc));
+
+    logger->info("discovering alleles from sampleset {} in {} range(s) on {} threads",
+                 sampleset, ranges.size(), nr_threads);
+    vector<discovered_alleles> valleles;
+    S(svc->discover_alleles(sampleset, ranges, sample_count, valleles, include_zero_copies));
+
+    for (auto it = valleles.begin(); it != valleles.end(); ++it) {
+        S(merge_discovered_alleles(*it, dsals));
+        it->clear();
+    }
+    logger->info("discovered {} alleles from sampleset {}", dsals.size(), sampleset);
+    return Status::OK();
+}
+
 Status unify_sites(std::shared_ptr<spdlog::logger> logger,
                    const unifier_config &unifier_cfg,
                    const vector<pair<string,size_t> > &contigs,

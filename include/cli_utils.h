@@ -139,6 +139,16 @@ Status discover_alleles(std::shared_ptr<spdlog::logger> logger,
                         unsigned &sample_count,
                         bool include_zero_copies = false);
 
+// Discover alleles from a specific sampleset (for incremental pipeline).
+Status discover_alleles_from_sampleset(std::shared_ptr<spdlog::logger> logger,
+                                       size_t nr_threads, KeyValue::DB *db,
+                                       const std::string &sampleset,
+                                       const std::vector<range> &ranges,
+                                       const std::vector<std::pair<std::string,size_t> > &contigs,
+                                       discovered_alleles &dsals,
+                                       unsigned &sample_count,
+                                       bool include_zero_copies = false);
+
 
 // Run unifier on given discovered alleles.
 // input dsals is cleared by side-effect to save memory
